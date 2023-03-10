@@ -1,0 +1,8 @@
+dill
+jsonlines
+pandas
+allennlp
+transformers
+pytorch-lightning
+numpy
+# tensorflow # for tensorboard
