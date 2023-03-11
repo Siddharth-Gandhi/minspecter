@@ -60,6 +60,7 @@ class TripletGenerator:
             return
         # self.coviews[query] is a dictionary of format {paper_id: {count: 1, frac: 1}}
         candidates = [(k, v['count']) for k, v in self.coviews[query].items()]
+        # print(candidates)
         candidates = sorted(candidates, key=operator.itemgetter(1), reverse=True)
         if len(candidates) > 1:
             coview_spread = candidates[0][1] - candidates[-1][1]
@@ -102,6 +103,8 @@ class TripletGenerator:
             else:
                 count_skipped += 1
         logger.info(f'Done generating triplets, #successful queries: {count_success},'
+                    f'#skipped queries: {count_skipped}')
+        print(f'Done generating triplets, #successful queries: {count_success},'
                     f'#skipped queries: {count_skipped}')
 
     def _get_easy_negatives(self, query_id: str, candidates: List[Tuple[str, float]], margin: float,
