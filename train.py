@@ -4,14 +4,13 @@ import glob
 import itertools
 import json
 import logging
+import logging.config
 import pickle
 import random
 from argparse import Namespace
 from typing import Dict
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 # pytorch lightning packages
 import pytorch_lightning as pl
@@ -24,9 +23,9 @@ import torch.nn.functional as F
 # allennlp dataloading packages
 from allennlp.data.dataset_readers.dataset_reader import DatasetReader
 from allennlp.data.token_indexers import TokenIndexer
-from allennlp.data.tokenizers import Tokenizer
-from allennlp.data.tokenizers.token import Token
-from allennlp.data.tokenizers.word_splitter import WordSplitter
+from allennlp.data.tokenizers import Token, Tokenizer
+
+# from allennlp.data.tokenizers.word_splitter import WordSplitter
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader, IterableDataset
@@ -40,6 +39,8 @@ from transformers.optimization import (
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
 )
+
+logger = logging.getLogger(__name__)
 
 # Globe constants
 training_size = 684100
@@ -69,9 +70,9 @@ class DataReaderFromPickled(DatasetReader):
     def __init__(
         self,
         lazy: bool = False,
-        word_splitter: WordSplitter = None,
-        tokenizer: Tokenizer = None,
-        token_indexers: Dict[str, TokenIndexer] = None,
+        # word_splitter: WordSplitter = None,
+        # tokenizer: Tokenizer = None,
+        # token_indexers: Dict[str, TokenIndexer] = None,
         max_sequence_length: int = 256,
         concat_title_abstract: bool = None,
     ) -> None:
@@ -83,7 +84,7 @@ class DataReaderFromPickled(DatasetReader):
         the other data reader at prediction time
         """
         self.max_sequence_length = max_sequence_length
-        self.token_indexers = token_indexers
+        # self.token_indexers = token_indexers
         self._concat_title_abstract = concat_title_abstract
         super().__init__(lazy)
 

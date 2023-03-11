@@ -2,23 +2,25 @@
 import argparse
 import json
 import logging
+import logging.config
 import os
 import pathlib
 import pickle
 import sys
+from dataclasses import dataclass
 from multiprocessing import Pool
 from typing import List, Optional, Tuple
 
-# import triplet_sampling_parallel
-import min_triplet_sampling
 import tqdm
+
+# import triplet_sampling_parallel
 from allennlp.data import Instance
 from allennlp.data.fields import MetadataField, TextField
 
 # PretrainedBertIndexer,
-from allennlp.data.token_indexers import (
+from allennlp.data.token_indexers import (  # SingleIdTokenIndexer,
     PretrainedTransformerIndexer,
-    SingleIdTokenIndexer,
+    TokenIndexer,
 )
 
 # from allennlp.data.tokenizers.word_splitter import (
@@ -26,7 +28,8 @@ from allennlp.data.token_indexers import (
 #     SimpleWordSplitter,
 #     WordSplitter,
 # )
-from allennlp.data.tokenizers import PretrainedTransformerTokenizer, Token
+from allennlp.data.tokenizers import PretrainedTransformerTokenizer, Token, Tokenizer
+from min_triplet_sampling import MinTripletSampler  # pylint: disable=import-error
 
 # from allennlp.common.params import Params
 
@@ -37,24 +40,13 @@ from allennlp.data.tokenizers import PretrainedTransformerTokenizer, Token
 # from allennlp.training.util import datasets_from_params
 
 
-def init_logger(*, fn=None):
 
-    # !!! here
-    from importlib import (
-        reload,  # python 2.x don't need to import reload, use it directly
-    )
-    reload(logging)
-
-    logging_params = {
-        'level': logging.INFO,
-        'format': '%(asctime)s,%(msecs)d %(levelname)-3s [%(filename)s:%(lineno)d] %(message)s'
-    }
-
-    if fn is not None:
-        logging_params['filename'] = fn
-
-    logging.basicConfig(**logging_params)
-    logging.info('reloading logger')
+logging.config.fileConfig(
+    fname="logging.conf",
+    disable_existing_loggers=False,
+    # defaults={'logfilename': f'/logs/{__name__}.log'},
+)
+logger = logging.getLogger(__file__)  # pylint: disable=invalid-name
 
 
 bert_params = {
@@ -72,113 +64,97 @@ bert_params = {
 # for more context, see: https://stackoverflow.com/questions/3288595/multiprocessing-how-to-use-pool-map-on-a-function-defined-in-a-class/21345308#21345308
 
 # global variables
-_tokenizer = None
-_token_indexers = None
-_token_indexer_id = None
-_max_sequence_length = None
-_concat_title_abstract = None
-_data_source = None
-_included_text_fields = None
+# _tokenizer = None
+# _token_indexers = None
+# _token_indexer_id = None
+# _max_sequence_length = None
+# _concat_title_abstract = None
+# _data_source = None
+# _included_text_fields = None
 
-# ----------------
+@dataclass()
+class SingleInstanceGenerator:
+    tokenizer: Tokenizer = None
+    token_indexers: TokenIndexer = None
+    max_sequence_length: int = -1
+    concat_title_abstract: bool = True
+    data_source:  str = None
+    included_text_fields: str = None
 
-
-def set_values(max_sequence_length: Optional[int] = -1,
-               concat_title_abstract: Optional[bool] = None,
-               data_source: Optional[str] = None,
-               included_text_fields: Optional[str] = None
-               ) -> None:  # sourcery skip: extract-method
-    # set global values
-    # note: a class with __init__ would have been a better design
-    # we have this structure for efficiency reasons: to support multiprocessing
-    # as multiprocessing with class methods is slower
-    global _tokenizer
-    global _token_indexers
-    global _token_indexer_id
-    global _max_sequence_length
-    global _concat_title_abstract
-    global _data_source
-    global _included_text_fields
-
-    if _tokenizer is None:  # if not initialized, initialize the tokenizers and token indexers
-        #TODO : might need to add bert params
+    def __post_init__(self):
+        # if self.tokenizer is None:  # if not initialized, initialize the tokenizers and token indexers
+            #TODO : might need to add bert params
         # _tokenizer = Tokenizer(word_splitter=BertBasicWordSplitter(do_lower_case=bert_params["do_lowercase"]))
-        _tokenizer = PretrainedTransformerTokenizer(model_name='bert-base-uncased')
+        self._tokenizer = self.tokenizer or PretrainedTransformerTokenizer(model_name='bert-base-uncased', max_length=self.max_sequence_length)
         # _token_indexers = {"bert": PretrainedBertIndexer.from_params(Params(bert_params))}
-        _token_indexers = PretrainedTransformerIndexer(model_name='bert-base-uncased' )
-        _token_indexer_id = {"tokens": SingleIdTokenIndexer(namespace='id')}
-    _max_sequence_length = max_sequence_length
-    _concat_title_abstract = concat_title_abstract
-    _data_source = data_source
-    _included_text_fields = included_text_fields
+        self._token_indexers = self.token_indexers or PretrainedTransformerIndexer(model_name='bert-base-uncased', max_length=self.max_sequence_length)
+        # _token_indexer_id = {"tokens": SingleIdTokenIndexer(namespace='id')}
+
+        self._max_sequence_length = self.max_sequence_length
+        self._concat_title_abstract = self.concat_title_abstract
+        self._data_source = self.data_source
+        self._included_text_fields = self.included_text_fields
 
 
-def get_text_tokens(title_tokens, abstract_tokens, abstract_delimiter):
-    """ concats title and abstract using a delimiter"""
-    if title_tokens[-1] != Token('.'):
+    def get_text_tokens(self, title_tokens, abstract_tokens, abstract_delimiter):
+        """ concats title and abstract using a delimiter"""
+        if title_tokens[-1] != Token('.'):
             title_tokens += [Token('.')]
 
-    title_tokens = title_tokens + abstract_delimiter + abstract_tokens
-    return title_tokens
+        title_tokens = title_tokens + abstract_delimiter + abstract_tokens
+        return title_tokens
 
-def get_instance(paper):
-    global _tokenizer
-    global _token_indexers
-    global _token_indexer_id
-    global _max_sequence_length
-    global _concat_title_abstract
-    global _data_source
-    global _included_text_fields
+    def get_instance(self, paper):
 
-    included_text_fields = set(_included_text_fields.split())
+        included_text_fields = set(self._included_text_fields.split())
 
-    query_abstract_tokens = _tokenizer.tokenize(paper.get("query_abstract") or "")
-    query_title_tokens = _tokenizer.tokenize(paper.get("query_title") or "")
+        query_abstract_tokens = self._tokenizer.tokenize(paper.get("query_abstract") or "")
+        query_title_tokens = self._tokenizer.tokenize(paper.get("query_title") or "")
 
-    pos_abstract_tokens = _tokenizer.tokenize(paper.get("pos_abstract") or "")
-    pos_title_tokens = _tokenizer.tokenize(paper.get("pos_title") or "")
+        pos_abstract_tokens = self._tokenizer.tokenize(paper.get("pos_abstract") or "")
+        pos_title_tokens = self._tokenizer.tokenize(paper.get("pos_title") or "")
 
-    neg_abstract_tokens = _tokenizer.tokenize(paper.get("neg_abstract") or "")
-    neg_title_tokens = _tokenizer.tokenize(paper.get("neg_title") or "")
+        neg_abstract_tokens = self._tokenizer.tokenize(paper.get("neg_abstract") or "")
+        neg_title_tokens = self._tokenizer.tokenize(paper.get("neg_title") or "")
 
-    if _concat_title_abstract and 'abstract' in included_text_fields:
-        abstract_delimiter = [Token('[SEP]')]
-        query_title_tokens = get_text_tokens(query_title_tokens, query_abstract_tokens, abstract_delimiter)
-        pos_title_tokens = get_text_tokens(pos_title_tokens, pos_abstract_tokens, abstract_delimiter)
-        neg_title_tokens = get_text_tokens(neg_title_tokens, neg_abstract_tokens, abstract_delimiter)
-        query_abstract_tokens = pos_abstract_tokens = neg_abstract_tokens = []
+        if self._concat_title_abstract and 'abstract' in included_text_fields:
+            abstract_delimiter = [Token('[SEP]')]
+            query_title_tokens = self.get_text_tokens(query_title_tokens, query_abstract_tokens, abstract_delimiter)
+            pos_title_tokens = self.get_text_tokens(pos_title_tokens, pos_abstract_tokens, abstract_delimiter)
+            neg_title_tokens = self.get_text_tokens(neg_title_tokens, neg_abstract_tokens, abstract_delimiter)
+            query_abstract_tokens = pos_abstract_tokens = neg_abstract_tokens = []
 
-    max_seq_len = _max_sequence_length
+        max_seq_len = self._max_sequence_length
 
-    if _max_sequence_length > 0:
-        query_abstract_tokens = query_abstract_tokens[:max_seq_len]
-        query_title_tokens = query_title_tokens[:max_seq_len]
-        pos_abstract_tokens = pos_abstract_tokens[:max_seq_len]
-        pos_title_tokens = pos_title_tokens[:max_seq_len]
-        neg_abstract_tokens = neg_abstract_tokens[:max_seq_len]
-        neg_title_tokens = neg_title_tokens[:max_seq_len]
+        if self._max_sequence_length > 0:
+            query_abstract_tokens = query_abstract_tokens[:max_seq_len]
+            query_title_tokens = query_title_tokens[:max_seq_len]
+            pos_abstract_tokens = pos_abstract_tokens[:max_seq_len]
+            pos_title_tokens = pos_title_tokens[:max_seq_len]
+            neg_abstract_tokens = neg_abstract_tokens[:max_seq_len]
+            neg_title_tokens = neg_title_tokens[:max_seq_len]
 
-    fields = {
-        "source_title": TextField(query_title_tokens, token_indexers=_token_indexers),
-        "pos_title": TextField(pos_title_tokens, token_indexers=_token_indexers),
-        "neg_title": TextField(neg_title_tokens, token_indexers=_token_indexers),
-        'source_paper_id': MetadataField(paper['query_paper_id']),
-        "pos_paper_id": MetadataField(paper['pos_paper_id']),
-        "neg_paper_id": MetadataField(paper['neg_paper_id']),
-    }
+        fields = {
+            "source_title": TextField(query_title_tokens, token_indexers=self._token_indexers),
+            "pos_title": TextField(pos_title_tokens, token_indexers=self._token_indexers),
+            "neg_title": TextField(neg_title_tokens, token_indexers=self._token_indexers),
+            'source_paper_id': MetadataField(paper['query_paper_id']),
+            "pos_paper_id": MetadataField(paper['pos_paper_id']),
+            "neg_paper_id": MetadataField(paper['neg_paper_id']),
+        }
 
-    if not _concat_title_abstract:
-        if query_abstract_tokens:
-            fields["source_abstract"] = TextField(query_abstract_tokens, token_indexers=_token_indexers)
-        if pos_abstract_tokens:
-            fields["pos_abstract"] = TextField(pos_abstract_tokens, token_indexers=_token_indexers)
-        if neg_abstract_tokens:
-            fields["neg_abstract"] = TextField(neg_abstract_tokens, token_indexers=_token_indexers)
+        if not self._concat_title_abstract:
+            if query_abstract_tokens:
+                fields["source_abstract"] = TextField(query_abstract_tokens, token_indexers=self._token_indexers)
+            if pos_abstract_tokens:
+                fields["pos_abstract"] = TextField(pos_abstract_tokens, token_indexers=self._token_indexers)
+            if neg_abstract_tokens:
+                fields["neg_abstract"] = TextField(neg_abstract_tokens, token_indexers=self._token_indexers)
 
-    if _data_source:
-        fields["data_source"] = MetadataField(_data_source)
+        if self._data_source:
+            fields["data_source"] = MetadataField(self._data_source)
 
-    return Instance(fields)
+        return Instance(fields)
 
 class TrainingInstanceGenerator:
 
@@ -186,37 +162,34 @@ class TrainingInstanceGenerator:
                  data,
                  metadata,
                  samples_per_query: int = 5,
-                 margin_fraction: float = 0.5,
                  ratio_hard_negatives: float = 0.3,
                  data_source: str = None):
         self.samples_per_query = samples_per_query
-        self.margin_fraction = margin_fraction
         self.ratio_hard_negatives = ratio_hard_negatives
         self.paper_feature_cache = {}
         self.metadata = metadata
         self.data_source = data_source
-
         self.data = data
-        # self.triplet_generator = TripletGenerator(
-        #     paper_ids=list(metadata.keys()),
-        #     coviews=data,
-        #     margin_fraction=self.margin_fraction,
-        #     samples_per_query=self.samples_per_query,
-        #     ratio_hard_negatives=self.ratio_hard_negatives
-        # )
+
+        self.triplet_generator = MinTripletSampler(
+            paper_ids=list(metadata.keys()),
+            coviews=data,
+            samples_per_query=self.samples_per_query,
+            ratio_hard_easy_neg=self.ratio_hard_negatives
+        )
 
     def _get_paper_features(self, paper: Optional[dict] = None) -> \
         Tuple[List[Token], List[Token], List[Token], int, List[Token]]:
-        if paper:
-            paper_id = paper.get('paper_id')
-            if paper_id in self.paper_feature_cache:  # This function is being called by the same paper multiple times.
-                return self.paper_feature_cache[paper_id]
-
-            features = paper.get('abstract'), paper.get('title'), paper.get('references')
-            self.paper_feature_cache[paper_id] = features
-            return features
-        else:
+        if not paper:
             return None, None, None
+        paper_id = paper.get('paper_id')
+        if paper_id in self.paper_feature_cache:  # This function is being called by the same paper multiple times.
+            return self.paper_feature_cache[paper_id]
+
+        features = paper.get('abstract'), paper.get('title'), paper.get('references')
+        self.paper_feature_cache[paper_id] = features
+        return features
+
 
     def get_raw_instances(self, query_ids, subset_name=None, n_jobs=10):
         """
@@ -237,11 +210,12 @@ class TrainingInstanceGenerator:
         count_success, count_fail = 0, 0
         # instances = []
         paper_ids = list(self.metadata.keys())
-        ts = min_triplet_sampling.MinTripletSampler()
-        for triplet in triplet_sampling_parallel.generate_triplets(list(self.metadata.keys()), self.data,
-                                                            self.margin_fraction, self.samples_per_query,
-                                                            self.ratio_hard_negatives, query_ids,
-                                                            data_subset=subset_name, n_jobs=n_jobs):
+        ts = MinTripletSampler(paper_ids=paper_ids, coviews=self.data, samples_per_query=self.samples_per_query, ratio_hard_easy_neg=self.ratio_hard_negatives)
+        # for triplet in triplet_sampling_parallel.generate_triplets(list(self.metadata.keys()), self.data,
+        #                                                     self.margin_fraction, self.samples_per_query,
+        #                                                     self.ratio_hard_negatives, query_ids,
+        #                                                     data_subset=subset_name, n_jobs=n_jobs):
+        for triplet in ts.generate_triplets(query_ids):
             try:
                 query_paper = self.metadata[triplet[0]]
                 pos_paper = self.metadata[triplet[1][0]]
@@ -281,7 +255,7 @@ class TrainingInstanceGenerator:
 
 
 def get_instances(data, query_ids_file, metadata, data_source=None, n_jobs=1, n_jobs_raw=12,
-                  ratio_hard_negatives=0.3, margin_fraction=0.5, samples_per_query=5,
+                  ratio_hard_negatives=0.3, samples_per_query=5,
                   concat_title_abstract=False, included_text_fields='title abstract'):
     """
     Gets allennlp instances from the data file
@@ -304,15 +278,20 @@ def get_instances(data, query_ids_file, metadata, data_source=None, n_jobs=1, n_
         raise RuntimeError(f"argument `n_jobs`={n_jobs} is invalid, should be >0")
 
     generator = TrainingInstanceGenerator(data=data, metadata=metadata, data_source=data_source,
-                                          margin_fraction=margin_fraction, ratio_hard_negatives=ratio_hard_negatives,
+                                           ratio_hard_negatives=ratio_hard_negatives,
                                           samples_per_query=samples_per_query)
 
-    set_values(max_sequence_length=512,
+    # set_values(max_sequence_length=512,
+    #            concat_title_abstract=concat_title_abstract,
+    #            data_source=data_source,
+    #            included_text_fields=included_text_fields)
+
+    igenerator = SingleInstanceGenerator(max_sequence_length=512,
                concat_title_abstract=concat_title_abstract,
                data_source=data_source,
                included_text_fields=included_text_fields)
 
-    query_ids = [line.strip() for line in open(query_ids_file)]
+    query_ids = [line.strip() for line in open(query_ids_file, 'r', encoding='utf-8')]
 
     instances_raw = list(
         generator.get_raw_instances(
@@ -325,13 +304,13 @@ def get_instances(data, query_ids_file, metadata, data_source=None, n_jobs=1, n_
     if n_jobs == 1:
         logger.info('converting raw instances to allennlp instances:')
         for e in tqdm.tqdm(instances_raw):
-            yield get_instance(e)
+            yield igenerator.get_instance(e)
 
     else:
         logger.info(f'converting raw instances to allennlp instances ({n_jobs} parallel jobs)')
         with Pool(n_jobs) as p:
             instances = list(tqdm.tqdm(p.imap(
-                get_instance, instances_raw)))
+                igenerator.get_instance, instances_raw)))
 
         # multiprocessing does not work as generator, needs to generate everything
         # see: https://stackoverflow.com/questions/5318936/python-multiprocessing-pool-lazy-iteration
@@ -339,7 +318,7 @@ def get_instances(data, query_ids_file, metadata, data_source=None, n_jobs=1, n_
 
 
 def main(data_files, train_ids, val_ids, test_ids, metadata_file, outdir, n_jobs=1, njobs_raw=1,
-         margin_fraction=0.5, ratio_hard_negatives=0.3, samples_per_query=5, comment='', bert_vocab='',
+          ratio_hard_negatives=0.4, samples_per_query=5, comment='', bert_vocab='',
          concat_title_abstract=False, included_text_fields='title abstract'):
     """
     Generates instances from a list of datafiles and stores them as a stream of objects
@@ -364,17 +343,17 @@ def main(data_files, train_ids, val_ids, test_ids, metadata_file, outdir, n_jobs
         Nothing
             Creates files corresponding to each data file
     """
-    global bert_params
+    # global bert_params
     bert_params['pretrained_model'] = bert_vocab
 
     pathlib.Path(outdir).mkdir(parents=True, exist_ok=True)
-    with open(metadata_file) as f_in:
+    with open(metadata_file, 'r', encoding='utf-8') as f_in:
         logger.info(f'loading metadata: {metadata_file}')
         metadata = json.load(f_in)
 
     for data_file, train_set, val_set, test_set in zip(data_files, train_ids, val_ids, test_ids):
         logger.info(f'loading data file: {data_file}')
-        with open(data_file) as f_in:
+        with open(data_file, 'r', encoding='utf-8') as f_in:
             data = json.load(f_in)
         data_source = data_file.split('/')[-1][:-5]  # e.g., coviews_v2012
         if comment:
@@ -394,7 +373,6 @@ def main(data_files, train_ids, val_ids, test_ids, metadata_file, outdir, n_jobs
                                               metadata=metadata,
                                               data_source=data_source,
                                               n_jobs=n_jobs, n_jobs_raw=njobs_raw,
-                                              margin_fraction=margin_fraction,
                                               ratio_hard_negatives=ratio_hard_negatives,
                                               samples_per_query=samples_per_query,
                                               concat_title_abstract=concat_title_abstract,
@@ -405,7 +383,7 @@ def main(data_files, train_ids, val_ids, test_ids, metadata_file, outdir, n_jobs
                     if idx % 2000 == 0:
                         pickler.clear_memo()
             metrics[ds_name] = idx
-        with open(f'{outdir}/{data_source}-metrics.json', 'w') as f_out2:
+        with open(f'{outdir}/{data_source}-metrics.json', 'w', encoding='utf-8') as f_out2:
             json.dump(metrics, f_out2, indent=2)
 
 
@@ -413,38 +391,38 @@ def main(data_files, train_ids, val_ids, test_ids, metadata_file, outdir, n_jobs
 if __name__ == '__main__':
 
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data-dir', help='path to a directory containing `data.json`, `train.csv`, `dev.csv` and `test.csv` files')
-    ap.add_argument('--metadata', help='path to the metadata file')
+    ap.add_argument('--data-dir', help='path to a directory containing `data.json`, `train.csv`, `dev.csv` and `test.csv` files', required=True)
+    ap.add_argument('--metadata', help='path to the metadata file', required=True)
     ap.add_argument('--outdir', help='output directory to files')
     ap.add_argument('--njobs', help='number of parallel jobs for instance conversion', default=1, type=int)
     ap.add_argument('--njobs_raw', help='number of parallel jobs for triplet generation', default=12, type=int)
-    ap.add_argument('--ratio_hard_negatives', default=0.3, type=float)
-    ap.add_argument('--samples_per_query', default=5, type=int)
-    ap.add_argument('--margin_fraction', default=0.5, type=float)
+    ap.add_argument('--ratio-hard-negatives', default=0.4, type=float)
+    ap.add_argument('--samples-per-query', default=5, type=int)
+    # ap.add_argument('--margin-fraction', default=0.5, type=float)
     ap.add_argument('--comment', default='', type=str)
-    ap.add_argument('--data_files', help='space delimted list of data files to override default', default=None)
-    ap.add_argument('--bert_vocab', help='path to bert vocab', default='data/scibert_scivocab_uncased/vocab.txt')
+    ap.add_argument('--data-files', help='space delimted list of data files to override default', default=None)
+    ap.add_argument('--bert-vocab', help='path to bert vocab', default='data/scibert_scivocab_uncased/vocab.txt')
     ap.add_argument('--concat-title-abstract', action='store_true', default=False)
     ap.add_argument('--included-text-fields', default='title abstract', help='space delimieted list of fields to include in the main text field; possible values: `title`, `abstract`, `authors`')
     args = ap.parse_args()
 
-    data_file = os.path.join(args.data_dir, 'data.json')
-    train_ids = os.path.join(args.data_dir, 'train.txt')
-    val_ids = os.path.join(args.data_dir, 'val.txt')
-    test_ids = os.path.join(args.data_dir, 'test.txt')
+    data_file_ = os.path.join(args.data_dir, 'data.json')
+    train_ids_ = os.path.join(args.data_dir, 'train.txt')
+    val_ids_ = os.path.join(args.data_dir, 'val.txt')
+    test_ids_= os.path.join(args.data_dir, 'test.txt')
+
+    # print(data_file, train_ids, val_ids, test_ids)
 
 
 
-    init_logger()
-    logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
     if args.metadata:
-        metadata_file = args.metadata
+        metadata_file_ = args.metadata
     else:
         logger.error('metadata file is required')
         sys.exit(1)
 
-    main([data_file], [train_ids], [val_ids], [test_ids], metadata_file, args.outdir, args.njobs, args.njobs_raw,
-         margin_fraction=args.margin_fraction, ratio_hard_negatives=args.ratio_hard_negatives,
+    main([data_file_], [train_ids_], [val_ids_], [test_ids_], metadata_file_, args.outdir, args.njobs, args.njobs_raw,
+          ratio_hard_negatives=args.ratio_hard_negatives,
          samples_per_query=args.samples_per_query, comment=args.comment, bert_vocab=args.bert_vocab,
          concat_title_abstract=args.concat_title_abstract, included_text_fields=args.included_text_fields
          )
