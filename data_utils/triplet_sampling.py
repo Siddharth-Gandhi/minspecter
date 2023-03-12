@@ -3,15 +3,17 @@ The script reads the coview/co-citation data and returns them as triplet format
 i.e., ['Query_paper', ('Positive_paper_id', num-coviews), ('Negative_paper_id', num_coviews)
 """
 import logging
+import logging.config
 import math
 import operator
 import random
-from typing import Dict, Iterator, List, NoReturn, Optional, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import numpy as np
 
+logging.config.fileConfig(fname="logging.conf", disable_existing_loggers=False)
 logger = logging.getLogger(__file__)  # pylint: disable=invalid-name
-logger.setLevel(logging.INFO)
+# logger.setLevel(logging.INFO)
 
 # positive example: high coviews
 # easy: those that have 0 coviews
@@ -21,21 +23,20 @@ logger.setLevel(logging.INFO)
 np.random.seed(321)
 random.seed(321)
 
+DIRECT_CITATION=5
+CO_CITATION=1
+NO_CITATION=0
 
-def is_int(n):
-    """ checks if a number is float. 2.0 is True while 0.3 is False"""
-    return round(n) == n
-
-
-class TripletGenerator:
+class MinTripletSampler:
     """ Class to generate triplets"""
 
     def __init__(self,
                  paper_ids: List[str],
                  coviews: Dict[str, List[Tuple[str, int]]],
-                 margin_fraction: float,
+                #  margin_fraction: float,
+                #  margin: int,
                  samples_per_query: int,
-                 ratio_hard_negatives: Optional[float]) -> NoReturn:
+                 ratio_hard_easy_neg: float) -> None:
         """
         Args:
             paper_ids: list of all paper ids
@@ -51,31 +52,70 @@ class TripletGenerator:
         self.paper_ids = paper_ids
         self.paper_ids_set = set(paper_ids)
         self.coviews = coviews
-        self.margin_fraction = margin_fraction
         self.samples_per_query = samples_per_query
-        self.ratio_hard_negatives = ratio_hard_negatives or 0.5
+        self.ratio_hard_easy_neg = ratio_hard_easy_neg
 
     def _get_triplet(self, query):
         if query not in self.coviews:
             return
         # self.coviews[query] is a dictionary of format {paper_id: {count: 1, frac: 1}}
         candidates = [(k, v['count']) for k, v in self.coviews[query].items()]
-        # print(candidates)
         candidates = sorted(candidates, key=operator.itemgetter(1), reverse=True)
-        if len(candidates) > 1:
-            coview_spread = candidates[0][1] - candidates[-1][1]
-        else:
-            coview_spread = 0
-        margin = self.margin_fraction * coview_spread  # minimum margin of coviews between good and bad sample
+        # if len(candidates) < self.samples_per_query:
+        #     # logger.warning(f'Not enough candidates for query {query}')
+        #     print(f'Not enough candidates for query {query}')
+        #     return None
 
-        # If distance is 1 increase margin to 1 otherwise any margin_fraction will pass
-        if is_int(candidates[0][1]) and is_int(candidates[-1][1]) and coview_spread == 1:
-            margin = np.ceil(margin)
+        # get positive, easy negative and hard negative samples
+        pos_citations = [candidate for candidate in candidates if candidate[1] == DIRECT_CITATION]
+        easy_neg_citations = list(self.paper_ids_set.difference(
+            {candidate[0] for candidate in candidates}
+        )) + [query]
+        hard_neg_citations = [candidate for candidate in candidates if candidate[1] == CO_CITATION]
 
-        difficult_triplets = self._get_hard_negatives(query, candidates, margin)
-        n_easy_samples = self.samples_per_query - len(difficult_triplets)
-        easy_triplets = self._get_easy_negatives(query, candidates, margin, n_easy_samples)
-        return difficult_triplets + easy_triplets
+
+        # determine number of positive, easy anegative and hard negative samples
+        num_pos, num_hard_neg = len(pos_citations), len(hard_neg_citations)
+        num_pos = min(num_pos, self.samples_per_query)
+        num_hard_neg = min(num_hard_neg, math.floor(self.ratio_hard_easy_neg * self.samples_per_query))
+        num_easy_neg = self.samples_per_query - num_hard_neg
+
+        # randomly sample from all lists
+        random.shuffle(pos_citations)
+        pos_citations = pos_citations[:num_pos]
+        # easy_neg_citations = list(np.random.choice(easy_neg_citations, size=num_easy_neg, replace=False))
+        temp_set = set()
+        counter = 0
+
+        # WARNING: this works because I assume there are large enough number of easy negatives, but this is better than sampling from a huge list. Might go in infinite loop.
+        while True:
+            idx = np.random.randint(0, len(easy_neg_citations))
+            item = easy_neg_citations[idx]
+            if item in temp_set:
+                continue
+            temp_set.add(item)
+            counter += 1
+            if counter == num_easy_neg:
+                break
+        easy_neg_citations = list(temp_set)
+
+        easy_neg_citations = [(citation, NO_CITATION) for citation in easy_neg_citations]
+        random.shuffle(hard_neg_citations)
+        hard_neg_citations = hard_neg_citations[:num_hard_neg]
+
+        neg_citations = easy_neg_citations + hard_neg_citations
+
+        triplets = []
+        for i in range(num_pos):
+            neg = (neg_citations[i], NO_CITATION) if isinstance(neg_citations[i], str) else neg_citations[i]
+            pos = pos_citations[i]
+            triplet =  [query, pos, neg]
+            triplets.append(triplet)
+
+        return triplets
+
+
+
 
     def generate_triplets(self, query_ids: List[str]) -> Iterator[List[Tuple]]:
         """ Generate triplets from a list of query ids
@@ -91,116 +131,50 @@ class TripletGenerator:
             Lists of tuples
                 The format of tuples is according to the triples
         """
-        # logger.info('Generating triplets for queries')
+        logger.info('Generating triplets for queries')
         count_skipped = 0  # count how many of the queries are not in coveiws file
         count_success = 0
 
         for query in query_ids:  # tqdm.tqdm(query_ids):
             results = self._get_triplet(query)
             if results:
-                yield from results
                 count_success += 1
+                yield from results
             else:
                 count_skipped += 1
-        logger.info(f'Done generating triplets, #successful queries: {count_success},'
-                    f'#skipped queries: {count_skipped}')
-        print(f'Done generating triplets, #successful queries: {count_success},'
-                    f'#skipped queries: {count_skipped}')
+        print(f'Done generating triplets, #successful queries: {count_success}, #skipped queries: {count_skipped}')
+        print(f'Total #triplets: {count_success * self.samples_per_query}')
 
-    def _get_easy_negatives(self, query_id: str, candidates: List[Tuple[str, float]], margin: float,
-                            n_samples: int) -> List[Tuple[str, Tuple[str, int], Tuple[str, int]]]:
-        """ Given a query get easy negative samples
-        Easy samples are defined by those that are at with 0 coviews/copdfs/etc.
 
-        Args:
-            query_id: string specifying the id of the query paper
-            candidates: a list of candidates, i.e., papers with co-view information with the query paper
-            margin: minimum distance of coviews between positive and negative example
-        """
-        # If there are fewer than 2 candidates, return none
-        # if len(candidates) < 2 or margin == 0:
-        if len(candidates) < 2:
-            return []
+def main():
+    import cProfile
+    import json
+    import pstats
 
-        # valid candidates are those with zeros
-        candidates_zero = list(self.paper_ids_set.difference([i[0] for i in candidates] + [query_id]))
+    training_folder = 'data/training'
 
-        # find valid candidates for good sample by going through sorted list
-        # in reverse and finding index of first sample with at least margin coviews
-        # note: this is another way to write candidates_pos = [i for i in candidates if i[1] > margin]
-        # but is much faster for large candidate arrays
-        candidates_pos = []
-        for j in range(len(candidates) - 1, -1, -1):
-            if candidates[j][1] > margin + candidates[-1][1]:
-                candidates_pos = candidates[:j + 1]
-                break
-                # else:
-                #     candidates_pos = []
+    with open(f'{training_folder}/train copy.txt', 'r', encoding='utf-8') as f:
+        train = f.read().splitlines()
 
-        # if there are no valid candidates for good rec, return None to trigger query resample
-        if len(candidates_pos) == 0:
-            return []
+    with open(f'{training_folder}/metadata.json', 'r', encoding='utf-8') as f:
+        metadata = json.load(f)
 
-        easy_samples: List = []
-        for _ in range(n_samples):
-            pos = candidates_pos[np.random.randint(len(candidates_pos))]  # random good sample from candidates
-            neg = candidates_zero[np.random.randint(len(candidates_zero))]  # random zero
-            easy_samples.append([query_id, pos, (neg, float("-inf"))])
+    with open(f'{training_folder}/data.json', 'r', encoding='utf-8') as f:
+        data = json.load(f)
 
-        return easy_samples
+    paper_ids = list(metadata.keys())
 
-    def _get_hard_negatives(self, query_id: str, candidates: List[Tuple[str, float]], margin: float) ->\
-            List[Tuple[str, Tuple[str, int], Tuple[str, int]]]:
-        """ Given a query get difficult negative samples
-        hard/difficult samples are defined by those samples that have fewer coviews than the positive ones
 
-        Args:
-            query_id: string specifying the id of the query paper
-            candidates: a list of candidates, i.e., papers with co-view information with the query paper
-            margin: minimum distance of coviews between positive and negative example
-        """
-        # If there are fewer than 2 candidates, return none
-        if len(candidates) < 2 or margin == 0:
-            return []
+    ts = MinTripletSampler(paper_ids=paper_ids, coviews=data, samples_per_query=5, ratio_hard_easy_neg=0.5)
 
-        # find valid candidates by going through sorted
-        # list and finding index of first sample with max coviews - margin
-        candidates_hard_neg = []
-        for j in range(len(candidates)):
-            if candidates[j][1] < (candidates[0][1] - margin):
-                candidates_hard_neg = candidates[j:]
-                break
-            # else:
-            #     candidates_hard_neg = []
+    with cProfile.Profile() as pr:
+        sum(1 for _ in ts.generate_triplets(train))
 
-        neg_len = len(candidates_hard_neg)
-        pos_len = len(candidates) - neg_len
+    stats = pstats.Stats(pr)
+    stats.sort_stats(pstats.SortKey.TIME)
+    # stats.print_stats()
+    stats.dump_stats('profile.prof')
 
-        if neg_len == 0:
-            return []
 
-        # generate hard candidates
-        samples_per_query = math.ceil(self.ratio_hard_negatives * self.samples_per_query)
-        # if there aren't enough candidates to generate enough unique samples
-        # reduce the number of samples to make it possible for them to be unique
-        if (pos_len * neg_len) < samples_per_query:
-            samples_per_query = pos_len * neg_len
-
-        hard_samples: List = []
-        candidates_pos = []
-        for _ in range(samples_per_query):
-            # find the negative sample first.
-            neg = candidates_hard_neg[np.random.randint(len(candidates_hard_neg))]  # random neg sample from candidates
-
-            # find the good sample. find valid candidates by going through sorted list
-            # in reverse and finding index of first sample with bad sample + margin
-            for j in range(len(candidates) - 1, -1, -1):
-                if candidates[j][1] > (neg[1] + margin):
-                    candidates_pos = candidates[:j + 1]
-                    break
-            pos = candidates_pos[np.random.randint(len(candidates_pos))]  # random pos sample from candidates
-
-            # append the good and bad samples with their coview number to output
-            hard_samples.append([query_id, pos, neg])
-
-        return hard_samples
+if __name__ == '__main__':
+    main()

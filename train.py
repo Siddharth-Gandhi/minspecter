@@ -8,7 +8,6 @@ import logging.config
 import pickle
 import random
 from argparse import Namespace
-from typing import Dict
 
 import numpy as np
 
@@ -22,8 +21,9 @@ import torch.nn.functional as F
 
 # allennlp dataloading packages
 from allennlp.data.dataset_readers.dataset_reader import DatasetReader
-from allennlp.data.token_indexers import TokenIndexer
-from allennlp.data.tokenizers import Token, Tokenizer
+
+# from allennlp.data.token_indexers import TokenIndexer
+from allennlp.data.tokenizers import Token  # , Tokenizer
 
 # from allennlp.data.tokenizers.word_splitter import WordSplitter
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -39,6 +39,14 @@ from transformers.optimization import (
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
 )
+
+# from typing import Dict
+
+
+
+
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -348,7 +356,7 @@ class Specter(pl.LightningModule):
         checkpoint_path = init_args.checkpoint_path
         logger.info(f"loading model from checkpoint: {checkpoint_path}")
 
-        self.hparams = init_args
+        self.hparams.update(vars(init_args))
         self.model = AutoModel.from_pretrained("allenai/scibert_scivocab_cased")
         self.tokenizer = AutoTokenizer.from_pretrained("allenai/scibert_scivocab_cased")
         self.tokenizer.model_max_length = self.model.config.max_position_embeddings
@@ -472,12 +480,7 @@ class Specter(pl.LightningModule):
         return [optimizer], [scheduler]
 
     def training_step(self, batch, batch_idx):
-        source_embedding = self.model(**batch[0])[1]
-        pos_embedding = self.model(**batch[1])[1]
-        neg_embedding = self.model(**batch[2])[1]
-
-        loss = self.triple_loss(source_embedding, pos_embedding, neg_embedding)
-
+        loss = self._extracted_from_validation_step_2(batch)
         lr_scheduler = self.trainer.lr_schedulers[0]["scheduler"]
 
         self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
@@ -492,13 +495,16 @@ class Specter(pl.LightningModule):
         return {"loss": loss}
 
     def validation_step(self, batch, batch_idx):
+        loss = self._extracted_from_validation_step_2(batch)
+        self.log("val_loss", loss, on_step=True, on_epoch=False, prog_bar=True)
+        return {"val_loss": loss}
+
+    # TODO Rename this here and in `training_step` and `validation_step`
+    def _extracted_from_validation_step_2(self, batch):
         source_embedding = self.model(**batch[0])[1]
         pos_embedding = self.model(**batch[1])[1]
         neg_embedding = self.model(**batch[2])[1]
-
-        loss = self.triple_loss(source_embedding, pos_embedding, neg_embedding)
-        self.log("val_loss", loss, on_step=True, on_epoch=False, prog_bar=True)
-        return {"val_loss": loss}
+        return self.triple_loss(source_embedding, pos_embedding, neg_embedding)
 
     def _eval_end(self, outputs) -> tuple:
         avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
@@ -524,7 +530,7 @@ class Specter(pl.LightningModule):
             for key, value in self.embedding_output.items()
         ]
 
-        with open(self.hparams.save_dir + "/embedding_result.jsonl", "w") as fp:
+        with open(f"{self.hparams.save_dir}/embedding_result.jsonl", "w", encoding='utf-8') as fp:
             fp.write("\n".join(json.dumps(i) for i in embedding_output_list))
 
     def test_step(self, batch, batch_nb):
@@ -588,7 +594,7 @@ def parse_args():
     args = parser.parse_args()
 
     if args.input_dir is not None:
-        files = glob.glob(args.input_dir + "/*")
+        files = glob.glob(f"{args.input_dir}/*")
         for f in files:
             fname = f.split("/")[-1]
             if "train" in fname:
@@ -601,22 +607,21 @@ def parse_args():
 
 
 def get_train_params(args):
-    train_params = {}
-    train_params["precision"] = 16 if args.fp16 else 32
-    if (isinstance(args.gpus, int) and args.gpus > 1) or (
-        isinstance(args.gpus, list) and len(args.gpus) > 1
-    ):
-        train_params["distributed_backend"] = "ddp"
-    else:
-        train_params["distributed_backend"] = None
-    train_params["accumulate_grad_batches"] = args.grad_accum
-    train_params["track_grad_norm"] = -1
-    train_params["limit_val_batches"] = args.limit_val_batches
-    train_params["val_check_interval"] = args.val_check_interval
-    train_params["gpus"] = args.gpus
-    train_params["max_epochs"] = args.num_epochs
-    train_params["log_every_n_steps"] = log_every_n_steps
-    return train_params
+    return {
+        "precision": 16 if args.fp16 else 32,
+        "distributed_backend": "ddp"
+        if (isinstance(args.gpus, int) and args.gpus > 1)
+        or (isinstance(args.gpus, list) and len(args.gpus) > 1)
+        else None,
+        "accumulate_grad_batches": args.grad_accum,
+        "track_grad_norm": -1,
+        "limit_val_batches": args.limit_val_batches,
+        "val_check_interval": args.val_check_interval,
+        "gpus": args.gpus,
+        "max_epochs": args.num_epochs,
+        "log_every_n_steps": log_every_n_steps
+        # "inference_mode": False
+    }
 
 
 def main():
@@ -644,7 +649,7 @@ def main():
         trainer.test(model)
 
     else:
-
+        print(args)
         model = Specter(args)
 
         # default logger used by trainer
@@ -660,8 +665,7 @@ def main():
             save_top_k=1,
             verbose=True,
             monitor="avg_val_loss",  # monitors metrics logged by self.log.
-            mode="min",
-            prefix="",
+            mode="min"
         )
 
         extra_train_params = get_train_params(args)

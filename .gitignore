@@ -133,3 +133,5 @@ data/
 .vscode
 .DS_STORE
 *.ipynb
+model-output/
+logs/
